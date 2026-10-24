@@ -1,4 +1,3 @@
-
 name: Build APK
 
 on:
@@ -33,6 +32,25 @@ jobs:
           set -euo pipefail
           mkdir -p www
           cp index.html www/index.html
+
+          # tell the home screen widget which city the app is showing
+          cat > www/sync.js <<'EOF'
+          (function () {
+            var last = "";
+            function sync() {
+              try {
+                var c = JSON.parse(localStorage.getItem("weather-city") || "null") || { n: "إسطنبول", lat: 41.01, lon: 28.98 };
+                var key = c.n + "|" + c.lat + "|" + c.lon;
+                if (window.AndroidWidget && key !== last) { AndroidWidget.setCity(c.n, c.lat, c.lon); last = key; }
+              } catch (e) {}
+            }
+            sync();
+            setTimeout(sync, 1500);
+            setInterval(sync, 4000);
+          })();
+          EOF
+          sed -i 's#</body>#<script src="sync.js"></script></body>#' www/index.html
+
           npm init -y
           npm install --no-audit --no-fund @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
           cat > capacitor.config.json <<'EOF'
@@ -46,6 +64,7 @@ jobs:
           npx cap add android
 
           RES=android/app/src/main/res
+          SRC=android/app/src/main/java/com/taqsi/weather
 
           # solid splash screen instead of the default Capacitor logo
           find "$RES" -name 'splash*.png' -delete
@@ -89,6 +108,278 @@ jobs:
 
           # dark status bar and navigation bar to match the app
           sed -i 's#<style name="AppTheme.NoActionBar" parent="Theme.AppCompat.DayNight.NoActionBar">#&\n        <item name="android:statusBarColor">\#0B1530</item>\n        <item name="android:navigationBarColor">\#0B1530</item>#' "$RES/values/styles.xml"
+
+          # ---- home screen widget ----
+          mkdir -p "$RES/layout" "$RES/xml"
+          cat > "$RES/drawable/widget_bg.xml" <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <gradient android:angle="270" android:startColor="#62B0F0" android:endColor="#2B6FD0"/>
+              <corners android:radius="24dp"/>
+          </shape>
+          EOF
+          cat > "$RES/layout/weather_widget.xml" <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/w_root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="horizontal"
+              android:gravity="center_vertical"
+              android:padding="16dp"
+              android:background="@drawable/widget_bg">
+              <LinearLayout
+                  android:layout_width="0dp"
+                  android:layout_height="wrap_content"
+                  android:layout_weight="1"
+                  android:orientation="vertical">
+                  <TextView
+                      android:id="@+id/w_city"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="طقسي"
+                      android:textColor="#FFFFFF"
+                      android:textSize="15sp"
+                      android:textStyle="bold"
+                      android:singleLine="true"
+                      android:ellipsize="end"/>
+                  <TextView
+                      android:id="@+id/w_temp"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="--°"
+                      android:textColor="#FFFFFF"
+                      android:textSize="44sp"
+                      android:fontFamily="sans-serif-light"/>
+                  <TextView
+                      android:id="@+id/w_cond"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:textColor="#F2FFFFFF"
+                      android:textSize="14sp"
+                      android:singleLine="true"
+                      android:ellipsize="end"/>
+                  <TextView
+                      android:id="@+id/w_hilo"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:textColor="#D9FFFFFF"
+                      android:textSize="12sp"
+                      android:singleLine="true"
+                      android:ellipsize="end"/>
+              </LinearLayout>
+              <TextView
+                  android:id="@+id/w_icon"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:textSize="52sp"/>
+          </LinearLayout>
+          EOF
+          cat > "$RES/xml/weather_widget_info.xml" <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:minWidth="250dp"
+              android:minHeight="110dp"
+              android:updatePeriodMillis="1800000"
+              android:initialLayout="@layout/weather_widget"
+              android:previewLayout="@layout/weather_widget"
+              android:resizeMode="horizontal|vertical"
+              android:widgetCategory="home_screen"/>
+          EOF
+
+          cat > "$SRC/WeatherWidget.java" <<'EOF'
+          package com.taqsi.weather;
+
+          import android.app.PendingIntent;
+          import android.appwidget.AppWidgetManager;
+          import android.appwidget.AppWidgetProvider;
+          import android.content.ComponentName;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.widget.RemoteViews;
+
+          import java.io.BufferedReader;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+
+          import org.json.JSONObject;
+
+          public class WeatherWidget extends AppWidgetProvider {
+              static final String PREFS = "weather_widget";
+
+              @Override
+              public void onUpdate(final Context context, final AppWidgetManager manager, final int[] ids) {
+                  final PendingResult result = goAsync();
+                  final Context app = context.getApplicationContext();
+                  new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              refresh(app, manager, ids);
+                          } finally {
+                              result.finish();
+                          }
+                      }
+                  }).start();
+              }
+
+              static void updateAll(final Context context) {
+                  final Context app = context.getApplicationContext();
+                  new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          AppWidgetManager manager = AppWidgetManager.getInstance(app);
+                          int[] ids = manager.getAppWidgetIds(new ComponentName(app, WeatherWidget.class));
+                          if (ids != null && ids.length > 0) {
+                              refresh(app, manager, ids);
+                          }
+                      }
+                  }).start();
+              }
+
+              static void refresh(Context ctx, AppWidgetManager manager, int[] ids) {
+                  SharedPreferences sp = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+                  String name = sp.getString("name", "إسطنبول");
+                  double lat = Double.longBitsToDouble(sp.getLong("lat", Double.doubleToLongBits(41.01)));
+                  double lon = Double.longBitsToDouble(sp.getLong("lon", Double.doubleToLongBits(28.98)));
+                  String temp = sp.getString("temp", "--°");
+                  String cond = sp.getString("cond", "");
+                  String hilo = sp.getString("hilo", "");
+                  String icon = sp.getString("icon", "");
+                  try {
+                      String url = "https://api.open-meteo.com/v1/forecast?latitude=" + lat + "&longitude=" + lon
+                              + "&current=temperature_2m,weather_code,is_day"
+                              + "&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=1";
+                      JSONObject root = new JSONObject(get(url));
+                      JSONObject cur = root.getJSONObject("current");
+                      JSONObject daily = root.getJSONObject("daily");
+                      int code = cur.getInt("weather_code");
+                      boolean day = cur.getInt("is_day") == 1;
+                      temp = Math.round(cur.getDouble("temperature_2m")) + "°";
+                      cond = label(code);
+                      icon = emoji(code, day);
+                      hilo = "الأعلى " + Math.round(daily.getJSONArray("temperature_2m_max").getDouble(0)) + "°  ·  الأدنى "
+                              + Math.round(daily.getJSONArray("temperature_2m_min").getDouble(0)) + "°";
+                      sp.edit().putString("temp", temp).putString("cond", cond).putString("hilo", hilo).putString("icon", icon).apply();
+                  } catch (Exception e) {
+                      // keep the last values when offline
+                  }
+
+                  Intent launch = ctx.getPackageManager().getLaunchIntentForPackage(ctx.getPackageName());
+                  PendingIntent pi = null;
+                  if (launch != null) {
+                      pi = PendingIntent.getActivity(ctx, 0, launch, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                  }
+                  for (int i = 0; i < ids.length; i++) {
+                      RemoteViews v = new RemoteViews(ctx.getPackageName(), R.layout.weather_widget);
+                      v.setTextViewText(R.id.w_city, name);
+                      v.setTextViewText(R.id.w_temp, temp);
+                      v.setTextViewText(R.id.w_cond, cond);
+                      v.setTextViewText(R.id.w_hilo, hilo);
+                      v.setTextViewText(R.id.w_icon, icon);
+                      if (pi != null) {
+                          v.setOnClickPendingIntent(R.id.w_root, pi);
+                      }
+                      manager.updateAppWidget(ids[i], v);
+                  }
+              }
+
+              static String get(String u) throws Exception {
+                  HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
+                  c.setConnectTimeout(8000);
+                  c.setReadTimeout(8000);
+                  try {
+                      InputStream in = c.getInputStream();
+                      BufferedReader r = new BufferedReader(new InputStreamReader(in, "UTF-8"));
+                      StringBuilder sb = new StringBuilder();
+                      String line;
+                      while ((line = r.readLine()) != null) {
+                          sb.append(line);
+                      }
+                      return sb.toString();
+                  } finally {
+                      c.disconnect();
+                  }
+              }
+
+              static String label(int c) {
+                  if (c == 0) return "صافٍ";
+                  if (c == 1) return "صافٍ غالباً";
+                  if (c == 2) return "غائم جزئياً";
+                  if (c == 3) return "غائم";
+                  if (c == 45 || c == 48) return "ضباب";
+                  if (c >= 51 && c <= 57) return "رذاذ";
+                  if (c == 61 || c == 80) return "مطر خفيف";
+                  if (c == 63 || c == 81 || c == 66 || c == 67) return "مطر";
+                  if (c == 65 || c == 82) return "مطر غزير";
+                  if (c >= 71 && c <= 77) return "ثلج";
+                  if (c == 85 || c == 86) return "زخات ثلج";
+                  if (c >= 95) return "عاصفة رعدية";
+                  return "غير معروف";
+              }
+
+              static String emoji(int c, boolean day) {
+                  if (c <= 1) return day ? "\u2600\uFE0F" : "\uD83C\uDF19";
+                  if (c == 2) return day ? "\u26C5" : "\u2601\uFE0F";
+                  if (c == 3) return "\u2601\uFE0F";
+                  if (c == 45 || c == 48) return "\uD83C\uDF2B\uFE0F";
+                  if ((c >= 71 && c <= 77) || c == 85 || c == 86) return "\u2744\uFE0F";
+                  if (c >= 95) return "\u26C8\uFE0F";
+                  return "\uD83C\uDF27\uFE0F";
+              }
+          }
+          EOF
+
+          cat > "$SRC/MainActivity.java" <<'EOF'
+          package com.taqsi.weather;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.os.Bundle;
+          import android.webkit.JavascriptInterface;
+
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  try {
+                      getBridge().getWebView().addJavascriptInterface(new WidgetBridge(getApplicationContext()), "AndroidWidget");
+                  } catch (Exception e) {
+                      // the widget still works with the default city
+                  }
+              }
+
+              static class WidgetBridge {
+                  private final Context ctx;
+
+                  WidgetBridge(Context ctx) {
+                      this.ctx = ctx;
+                  }
+
+                  @JavascriptInterface
+                  public void setCity(String name, double lat, double lon) {
+                      SharedPreferences sp = ctx.getSharedPreferences(WeatherWidget.PREFS, Context.MODE_PRIVATE);
+                      if (name.equals(sp.getString("name", "")) && Double.doubleToLongBits(lat) == sp.getLong("lat", 0L)
+                              && Double.doubleToLongBits(lon) == sp.getLong("lon", 0L)) {
+                          return;
+                      }
+                      sp.edit().putString("name", name)
+                              .putLong("lat", Double.doubleToLongBits(lat))
+                              .putLong("lon", Double.doubleToLongBits(lon))
+                              .remove("temp").remove("cond").remove("hilo").remove("icon")
+                              .apply();
+                      WeatherWidget.updateAll(ctx);
+                  }
+              }
+          }
+          EOF
+
+          sed -i 's#</application>#    <receiver android:name=".WeatherWidget" android:exported="true">\n            <intent-filter>\n                <action android:name="android.appwidget.action.APPWIDGET_UPDATE"/>\n            </intent-filter>\n            <meta-data android:name="android.appwidget.provider" android:resource="@xml/weather_widget_info"/>\n        </receiver>\n    </application>#' android/app/src/main/AndroidManifest.xml
 
           npx cap sync android
 
